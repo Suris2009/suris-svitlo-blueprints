@@ -1,0 +1,468 @@
+blueprint:
+  name: 01 DTEK KREM — Графіки та аварійні сповіщення
+  domain: automation
+  author: Suris2009
+  homeassistant:
+    min_version: 2026.9.0
+  source_url: https://github.com/Suris2009/suris-svitlo-blueprints/blob/main/blueprints/automation/suris_dtek_krem/notifications.yaml
+  input:
+    krem_entry:
+      name: Запис інтеграції DTEK KREM Outages
+      selector:
+        config_entry:
+          integration: dtek_krem_outages
+    outage_group:
+      name: Черга
+      default: '1.1'
+      selector:
+        text: {}
+    telegram_chat_ids:
+      name: 'Telegram: одна або дві групи'
+      default: ''
+      selector:
+        text: {}
+    telegram_config_entry_id:
+      name: Telegram Bot Config Entry ID (необов’язково)
+      default: ''
+      selector:
+        text: {}
+    telegram_thread_id:
+      name: ID теми Telegram (необов’язково)
+      default: ''
+      selector:
+        text: {}
+    storage_helper:
+      name: Окремий текстовий помічник антиповтору (максимум 255)
+      selector:
+        entity:
+          filter:
+            domain: input_text
+    title_text:
+      name: Заголовок графіка
+      default: ⚠️ Оновлено графіки відключень!
+      selector:
+        text: {}
+    location_name:
+      name: Назва локації
+      default: Мій будинок
+      selector:
+        text: {}
+    send_on_first_run:
+      name: Надсилати графік новій групі при першому запуску
+      default: true
+      selector:
+        boolean: {}
+    notify_emergency_changes:
+      name: Повідомляти про аварійні відключення за адресою
+      default: true
+      selector:
+        boolean: {}
+    quiet_mode:
+      name: Тихий режим 23:00–05:00
+      default: false
+      selector:
+        boolean: {}
+alias: 01 DTEK KREM — Графіки та аварійні сповіщення
+triggers:
+- trigger: event
+  event_type: dtek_krem_outages_event
+  event_data:
+    config_entry_id: !input 'krem_entry'
+    type: schedule_published
+  id: schedule_published
+- trigger: event
+  event_type: dtek_krem_outages_event
+  event_data:
+    config_entry_id: !input 'krem_entry'
+    type: schedule_changed
+  id: schedule_changed
+- trigger: event
+  event_type: dtek_krem_outages_event
+  event_data:
+    config_entry_id: !input 'krem_entry'
+    type: address_outage
+  id: address_outage
+- trigger: homeassistant
+  event: start
+  id: startup
+- trigger: time_pattern
+  minutes: /5
+  id: retry
+variables:
+  krem_entry: !input 'krem_entry'
+  group_input: !input 'outage_group'
+  group_key: '{{ ''GPV'' ~ (group_input | string | trim | upper | replace(''GPV'', '''')) }}'
+  group_label: '{{ group_key | replace(''GPV'', '''') }}'
+  chat_ids_input: !input 'telegram_chat_ids'
+  bot_entry: !input 'telegram_config_entry_id'
+  thread_id: !input 'telegram_thread_id'
+  chat_ids: |-
+    {% set ns = namespace(ids=[]) %}
+    {% for value in (chat_ids_input | string).replace(';', ',').split(',') %}
+      {% set item = value | trim %}
+      {% if item and item not in ns.ids %}{% set ns.ids = ns.ids + [item] %}{% endif %}
+    {% endfor %}
+    {{ ns.ids }}
+  chat_ids_valid: |-
+    {% set ns = namespace(valid=1 <= chat_ids | count <= 2) %}
+    {% for item in chat_ids %}
+      {% if not (item is match('^-?[1-9][0-9]*$')) %}{% set ns.valid = false %}{% endif %}
+    {% endfor %}
+    {{ ns.valid }}
+  storage_helper: !input 'storage_helper'
+  base_title: !input 'title_text'
+  location_name: !input 'location_name'
+  send_on_first_run: !input 'send_on_first_run'
+  notify_emergency: !input 'notify_emergency_changes'
+  quiet_mode: !input 'quiet_mode'
+  force_send: '{{ trigger is not defined or trigger.id is not defined }}'
+  binding: '{{ ((krem_entry ~ ''|'' ~ group_key) | sha256)[:16] }}'
+actions:
+- if:
+  - condition: template
+    value_template: '{{ not chat_ids_valid }}'
+  then:
+  - stop: Вкажи один або два коректні числові Telegram Chat ID через кому.
+    error: true
+- if:
+  - condition: template
+    value_template: '{{ states(storage_helper) in [''unknown'', ''unavailable''] or state_attr(storage_helper, ''max'')
+      | int(0) < 255 }}'
+  then:
+  - stop: Створи окремий текстовий помічник KREM із максимальною довжиною 255.
+    error: true
+- condition: template
+  value_template: '{{ not quiet_mode or not (now().hour >= 23 or now().hour < 5) }}'
+- variables:
+    schedule_response: {}
+- action: dtek_krem_outages.get_schedule
+  continue_on_error: true
+  data:
+    config_entry_id: !input 'krem_entry'
+  response_variable: schedule_response
+- variables:
+    snapshot: |-
+      {% set ns = namespace(value={}) %}
+      {% set response = schedule_response if schedule_response is mapping else {} %}
+      {% set entries = response.get('entries', []) %}
+      {% if entries is sequence and entries is not string and entries is not mapping %}
+        {% for entry in entries %}
+          {% if entry is mapping and entry.get('config_entry_id') == krem_entry %}
+            {% set ns.value = entry %}
+          {% endif %}
+        {% endfor %}
+      {% endif %}
+      {{ ns.value }}
+- variables:
+    plan: |-
+      {%- set current = now() -%}
+      {%- set current_ts = as_timestamp(current) -%}
+      {%- set today = current.date().isoformat() -%}
+      {%- set tomorrow = (current + timedelta(days=1)).date().isoformat() -%}
+      {%- set publication = snapshot.get('publication', {}) -%}
+      {%- set publication = publication if publication is mapping else {} -%}
+      {%- set hidden = publication.get('schedule') == false or publication.get('daily') == false -%}
+      {%- set stale = snapshot.get('data_status') != 'current' -%}
+      {%- set source_groups = snapshot.get('groups', {}) -%}
+      {%- set source_groups = source_groups if source_groups is mapping else {} -%}
+      {%- set group_data = source_groups.get(group_key, {}) -%}
+      {%- set group_data = group_data if group_data is mapping else {} -%}
+      {%- set days = group_data.get('days', {}) -%}
+      {%- if not source_groups and snapshot.get('group') == group_key -%}
+        {%- set days = snapshot.get('days', {}) -%}
+      {%- endif -%}
+      {%- set days = days if days is mapping else {} -%}
+      {%- set available = snapshot | count > 0 and not snapshot.get('external_operator', false) -%}
+      {%- set ns = namespace(events=[], invalid=false, valid_days={}, signature=[]) -%}
+      {%- for date, day in days | dictsort -%}
+        {%- if day is mapping -%}
+          {%- set slots = day.get('schedule', '') -%}
+          {%- set valid_slots = slots is string and slots | length == 48 and slots is match('^[01?]{48}$') -%}
+          {%- if valid_slots -%}
+            {%- set ns.valid_days = dict(ns.valid_days, **{date: day}) -%}
+            {%- if date in [today, tomorrow] -%}
+              {%- set ns.signature = ns.signature + [[date, slots]] -%}
+            {%- endif -%}
+            {%- set items = day.get('outages', []) -%}
+            {%- if items is sequence and items is not string and items is not mapping -%}
+              {%- for item in items -%}
+                {%- if item is mapping -%}
+                  {%- set start = as_datetime(item.get('start'), none) -%}
+                  {%- set end = as_datetime(item.get('end'), none) -%}
+                  {%- if start is not none and start.tzinfo is none -%}{%- set start = start.replace(tzinfo=current.tzinfo) -%}{%- endif -%}
+                  {%- if end is not none and end.tzinfo is none -%}{%- set end = end.replace(tzinfo=current.tzinfo) -%}{%- endif -%}
+                  {%- set start_ts = as_timestamp(start, none) -%}
+                  {%- set end_ts = as_timestamp(end, none) -%}
+                  {%- if start_ts is not none and end_ts is not none and start_ts < end_ts -%}
+                    {%- set ns.events = ns.events + [{'start': start_ts, 'end': end_ts}] -%}
+                  {%- else -%}{%- set ns.invalid = true -%}{%- endif -%}
+                {%- else -%}{%- set ns.invalid = true -%}{%- endif -%}
+              {%- endfor -%}
+            {%- else -%}{%- set ns.invalid = true -%}{%- endif -%}
+          {%- elif date in [today, tomorrow] -%}{%- set ns.invalid = true -%}{%- endif -%}
+        {%- elif date in [today, tomorrow] -%}{%- set ns.invalid = true -%}{%- endif -%}
+      {%- endfor -%}
+      {%- set merged = namespace(events=[]) -%}
+      {%- for item in ns.events | sort(attribute='start') -%}
+        {%- if merged.events and item.start <= merged.events[-1].end -%}
+          {%- set prev = merged.events[-1] -%}
+          {%- set merged.events = merged.events[:-1] + [{'start': prev.start, 'end': [prev.end, item.end] | max}] -%}
+        {%- else -%}{%- set merged.events = merged.events + [item] -%}{%- endif -%}
+      {%- endfor -%}
+      {%- set window = namespace(current_end=none, next_start=none, sch='unknown') -%}
+      {%- if available and not hidden and not ns.invalid and today in ns.valid_days -%}
+        {%- set slot = current.hour * 2 + current.minute // 30 -%}
+        {%- set char = ns.valid_days[today]['schedule'][slot] -%}
+        {%- set window.sch = 'off' if char == '0' else 'on' if char == '1' else 'unknown' -%}
+        {%- for item in merged.events -%}
+          {%- if item.start <= current_ts < item.end -%}
+            {%- set end_local = as_datetime(item.end | timestamp_local).astimezone(current.tzinfo) -%}
+            {%- set end_date = end_local.date().isoformat() -%}
+            {%- set end_slot = end_local.hour * 2 + end_local.minute // 30 -%}
+            {%- if end_date in ns.valid_days and ns.valid_days[end_date]['schedule'][end_slot] == '1' -%}
+              {%- set window.current_end = item.end -%}
+            {%- endif -%}
+          {%- elif item.start > current_ts and window.next_start is none -%}
+            {%- set window.next_start = item.start -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {%- set address = snapshot.get('address_outage') -%}
+      {%- set address = address if address is mapping else {} -%}
+      {%- set address_fresh = available and snapshot.get('connection') == 'ok' and snapshot.get('settlement') and snapshot.get('street') and snapshot.get('house') and publication.get('current_outage') != false -%}
+      {%- set emergency = address_fresh and address.get('kind') == 'emergency' -%}
+      {{- {'available': available, 'hidden': hidden, 'stale': stale, 'invalid': ns.invalid,
+           'days': ns.valid_days, 'events': merged.events, 'signature': ns.signature,
+           'today': today, 'tomorrow': tomorrow, 'today_known': today in ns.valid_days,
+           'tomorrow_known': tomorrow in ns.valid_days, 'sch': window.sch,
+           'current_end': window.current_end, 'next_start': window.next_start,
+           'address_fresh': address_fresh | bool, 'emergency': emergency | bool,
+           'address': address} -}}
+- condition: template
+  value_template: '{{ plan.available }}'
+- variables:
+    saved: |-
+      {% set raw = states(storage_helper) %}
+      {% set value = (raw[3:] if raw.startswith('K1|') else '') | from_json({}) %}
+      {{ value if value is mapping and value.get('v') == 1 and value.get('b') == binding else {} }}
+    schedule_fingerprint: '{{ (([plan.signature, base_title, location_name, group_key] | to_json) | sha256)[:16]
+      }}'
+    address_fingerprint: '{{ ''E'' ~ (((plan.address | to_json) | sha256)[:16]) if plan.emergency else ''N'' }}'
+    schedule_message: |-
+      {%- set lines = namespace(items=[base_title | e, '📍 ' ~ (location_name | e) ~ ' • Черга ' ~ (group_label | e)]) -%}
+          {%- for date, title in [(plan.today, 'СЬОГОДНІ'), (plan.tomorrow, 'ЗАВТРА')] -%}
+            {%- set day = plan.days.get(date) -%}
+            {%- if day is mapping -%}
+              {%- set date_dt = as_datetime(date ~ 'T00:00:00') -%}
+              {%- set lines.items = lines.items + ['', '📅 ' ~ title ~ ' (' ~ date_dt.strftime('%d.%m.%Y') ~ ')'] -%}
+              {%- set runs = namespace(items=[]) -%}
+              {%- for event in day.get('outages', []) -%}
+                {%- set start = as_datetime(event.start) -%}
+                {%- set end = as_datetime(event.end) -%}
+                {%- if date != plan.today or as_timestamp(end) > as_timestamp(now()) -%}
+                  {%- set end_text = '24:00' if end.astimezone(now().tzinfo).date().isoformat() > date else end.astimezone(now().tzinfo).strftime('%H:%M') -%}
+                  {%- set runs.items = runs.items + ['❌ ' ~ start.astimezone(now().tzinfo).strftime('%H:%M') ~ ' ━ ' ~ end_text] -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {%- if runs.items -%}
+                {%- set lines.items = lines.items + runs.items -%}
+              {%- elif '?' in day.schedule -%}
+                {%- set lines.items = lines.items + ['🔸 Є можливі відключення; підтверджений час не визначено'] -%}
+              {%- else -%}
+                {%- set lines.items = lines.items + ['⚡ Далі за графіком без відключень' if date == plan.today else '⚡ За графіком без відключень'] -%}
+              {%- endif -%}
+            {%- else -%}
+              {%- set lines.items = lines.items + ['', '📅 ' ~ title ~ ': графік ще не опубліковано'] -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{- lines.items | join('
+      ') -}}
+    emergency_message: |-
+      {%- if plan.emergency -%}
+            {%- set lines = namespace(items=['🚨 <b>ДТЕК: АВАРІЙНЕ ВІДКЛЮЧЕННЯ ЗА АДРЕСОЮ</b>', '', '📍 ' ~ (location_name | e)]) -%}
+            {%- if plan.address.get('reason') -%}{%- set lines.items = lines.items + ['Причина: ' ~ (plan.address.reason | string | e)] -%}{%- endif -%}
+            {%- set end = as_datetime(plan.address.get('end'), none) -%}
+            {%- if end is not none -%}
+              {%- set lines.items = lines.items + ['Орієнтовне відновлення за ДТЕК: ' ~ end.astimezone(now().tzinfo).strftime('%H:%M (%d.%m)')] -%}
+            {%- else -%}{%- set lines.items = lines.items + ['Час відновлення ДТЕК не повідомив'] -%}{%- endif -%}
+            {%- set lines.items = lines.items + ['', '⚠️ Графік черги може не діяти. Фактичний стан світла визначає наш датчик.'] -%}
+            {{- lines.items | join('
+      ') -}}
+          {%- else -%}
+            {{- ['✅ <b>ДТЕК ОНОВИВ ІНФОРМАЦІЮ ЗА АДРЕСОЮ</b>', '', '📍 ' ~ (location_name | e),
+                 'ДТЕК більше не позначає це відключення як аварійне.',
+                 'Фактичне повернення світла підтвердить наш датчик.'] | join('
+      ') -}}
+          {%- endif -%}
+- variables:
+    rollover_only: '{{ not force_send and trigger.id in [''retry'', ''startup''] and saved.get(''d'', plan.today)
+      != plan.today }}'
+- repeat:
+    for_each: '{{ chat_ids }}'
+    sequence:
+    - variables:
+        destination: '{{ repeat.item }}'
+        channel: s
+        fingerprint: '{{ schedule_fingerprint }}'
+        message: '{{ schedule_message }}'
+    - variables:
+        previous: '{{ saved.get(''s'', {}).get(destination | string, '''') }}'
+    - if:
+      - condition: template
+        value_template: '{{ not plan.hidden and not plan.stale and not plan.invalid and (plan.today_known or plan.tomorrow_known)
+          }}'
+      then:
+      - choose:
+        - conditions: '{{ previous != '''' and rollover_only and not force_send }}'
+          sequence:
+          - action: input_text.set_value
+            target:
+              entity_id: !input 'storage_helper'
+            data:
+              value: |-
+                {%- set raw = states(storage_helper) -%}
+                {%- set current = (raw[3:] if raw.startswith('K1|') else '') | from_json({}) -%}
+                {%- set current = current if current is mapping and current.get('b') == binding else {} -%}
+                {%- set s = current.get('s', {}) -%}{%- set a = current.get('a', {}) -%}
+                {%- set s = s if s is mapping else {} -%}{%- set a = a if a is mapping else {} -%}
+                {%- if channel == 's' -%}{%- set s = dict(s, **{(destination | string): fingerprint}) -%}
+                {%- else -%}{%- set a = dict(a, **{(destination | string): fingerprint}) -%}{%- endif -%}
+                {%- set clean = namespace(s={}, a={}) -%}
+                {%- for chat in chat_ids -%}
+                  {%- if chat in s -%}{%- set clean.s = dict(clean.s, **{chat: s[chat]}) -%}{%- endif -%}
+                  {%- if chat in a -%}{%- set clean.a = dict(clean.a, **{chat: a[chat]}) -%}{%- endif -%}
+                {%- endfor -%}
+                {{ 'K1|' ~ ({'v': 1, 'b': binding, 'd': plan.today, 's': clean.s, 'a': clean.a} | to_json) }}
+        - conditions: '{{ previous == '''' and not send_on_first_run and not force_send }}'
+          sequence:
+          - action: input_text.set_value
+            target:
+              entity_id: !input 'storage_helper'
+            data:
+              value: |-
+                {%- set raw = states(storage_helper) -%}
+                {%- set current = (raw[3:] if raw.startswith('K1|') else '') | from_json({}) -%}
+                {%- set current = current if current is mapping and current.get('b') == binding else {} -%}
+                {%- set s = current.get('s', {}) -%}{%- set a = current.get('a', {}) -%}
+                {%- set s = s if s is mapping else {} -%}{%- set a = a if a is mapping else {} -%}
+                {%- if channel == 's' -%}{%- set s = dict(s, **{(destination | string): fingerprint}) -%}
+                {%- else -%}{%- set a = dict(a, **{(destination | string): fingerprint}) -%}{%- endif -%}
+                {%- set clean = namespace(s={}, a={}) -%}
+                {%- for chat in chat_ids -%}
+                  {%- if chat in s -%}{%- set clean.s = dict(clean.s, **{chat: s[chat]}) -%}{%- endif -%}
+                  {%- if chat in a -%}{%- set clean.a = dict(clean.a, **{chat: a[chat]}) -%}{%- endif -%}
+                {%- endfor -%}
+                {{ 'K1|' ~ ({'v': 1, 'b': binding, 'd': plan.today, 's': clean.s, 'a': clean.a} | to_json) }}
+        - conditions: '{{ force_send or fingerprint != previous }}'
+          sequence:
+          - variables:
+              send_result: {}
+              telegram_data: |-
+                {% set data = {'chat_id': destination | int, 'message': message, 'parse_mode': 'html'} %}
+                {% if bot_entry | trim %}{% set data = dict(data, config_entry_id=bot_entry | trim) %}{% endif %}
+                {% if thread_id | string | trim %}{% set data = dict(data, message_thread_id=thread_id | int) %}{% endif %}
+                {{ data }}
+          - action: telegram_bot.send_message
+            continue_on_error: true
+            data: '{{ telegram_data }}'
+            response_variable: send_result
+          - if:
+            - condition: template
+              value_template: |-
+                {% set ns = namespace(ok=false) %}
+                {% for item in (send_result.get('chats', []) if send_result is mapping else []) %}
+                  {% if item is mapping and item.get('chat_id') | string == destination | string and item.get('message_id') is not none %}{% set ns.ok = true %}{% endif %}
+                {% endfor %}
+                {{ ns.ok }}
+            then:
+            - action: input_text.set_value
+              target:
+                entity_id: !input 'storage_helper'
+              data:
+                value: |-
+                  {%- set raw = states(storage_helper) -%}
+                  {%- set current = (raw[3:] if raw.startswith('K1|') else '') | from_json({}) -%}
+                  {%- set current = current if current is mapping and current.get('b') == binding else {} -%}
+                  {%- set s = current.get('s', {}) -%}{%- set a = current.get('a', {}) -%}
+                  {%- set s = s if s is mapping else {} -%}{%- set a = a if a is mapping else {} -%}
+                  {%- if channel == 's' -%}{%- set s = dict(s, **{(destination | string): fingerprint}) -%}
+                  {%- else -%}{%- set a = dict(a, **{(destination | string): fingerprint}) -%}{%- endif -%}
+                  {%- set clean = namespace(s={}, a={}) -%}
+                  {%- for chat in chat_ids -%}
+                    {%- if chat in s -%}{%- set clean.s = dict(clean.s, **{chat: s[chat]}) -%}{%- endif -%}
+                    {%- if chat in a -%}{%- set clean.a = dict(clean.a, **{chat: a[chat]}) -%}{%- endif -%}
+                  {%- endfor -%}
+                  {{ 'K1|' ~ ({'v': 1, 'b': binding, 'd': plan.today, 's': clean.s, 'a': clean.a} | to_json) }}
+    - variables:
+        channel: a
+        fingerprint: '{{ address_fingerprint }}'
+        message: '{{ emergency_message }}'
+        previous_address: '{{ saved.get(''a'', {}).get(destination | string, '''') }}'
+    - if:
+      - condition: template
+        value_template: '{{ notify_emergency and plan.address_fresh }}'
+      then:
+      - choose:
+        - conditions: '{{ (plan.emergency and (force_send or fingerprint != previous_address)) or (not plan.emergency
+            and previous_address.startswith(''E'')) }}'
+          sequence:
+          - variables:
+              send_result: {}
+              telegram_data: |-
+                {% set data = {'chat_id': destination | int, 'message': message, 'parse_mode': 'html'} %}
+                {% if bot_entry | trim %}{% set data = dict(data, config_entry_id=bot_entry | trim) %}{% endif %}
+                {% if thread_id | string | trim %}{% set data = dict(data, message_thread_id=thread_id | int) %}{% endif %}
+                {{ data }}
+          - action: telegram_bot.send_message
+            continue_on_error: true
+            data: '{{ telegram_data }}'
+            response_variable: send_result
+          - if:
+            - condition: template
+              value_template: |-
+                {% set ns = namespace(ok=false) %}
+                {% for item in (send_result.get('chats', []) if send_result is mapping else []) %}
+                  {% if item is mapping and item.get('chat_id') | string == destination | string and item.get('message_id') is not none %}{% set ns.ok = true %}{% endif %}
+                {% endfor %}
+                {{ ns.ok }}
+            then:
+            - action: input_text.set_value
+              target:
+                entity_id: !input 'storage_helper'
+              data:
+                value: |-
+                  {%- set raw = states(storage_helper) -%}
+                  {%- set current = (raw[3:] if raw.startswith('K1|') else '') | from_json({}) -%}
+                  {%- set current = current if current is mapping and current.get('b') == binding else {} -%}
+                  {%- set s = current.get('s', {}) -%}{%- set a = current.get('a', {}) -%}
+                  {%- set s = s if s is mapping else {} -%}{%- set a = a if a is mapping else {} -%}
+                  {%- if channel == 's' -%}{%- set s = dict(s, **{(destination | string): fingerprint}) -%}
+                  {%- else -%}{%- set a = dict(a, **{(destination | string): fingerprint}) -%}{%- endif -%}
+                  {%- set clean = namespace(s={}, a={}) -%}
+                  {%- for chat in chat_ids -%}
+                    {%- if chat in s -%}{%- set clean.s = dict(clean.s, **{chat: s[chat]}) -%}{%- endif -%}
+                    {%- if chat in a -%}{%- set clean.a = dict(clean.a, **{chat: a[chat]}) -%}{%- endif -%}
+                  {%- endfor -%}
+                  {{ 'K1|' ~ ({'v': 1, 'b': binding, 'd': plan.today, 's': clean.s, 'a': clean.a} | to_json) }}
+        default:
+        - action: input_text.set_value
+          target:
+            entity_id: !input 'storage_helper'
+          data:
+            value: |-
+              {%- set raw = states(storage_helper) -%}
+              {%- set current = (raw[3:] if raw.startswith('K1|') else '') | from_json({}) -%}
+              {%- set current = current if current is mapping and current.get('b') == binding else {} -%}
+              {%- set s = current.get('s', {}) -%}{%- set a = current.get('a', {}) -%}
+              {%- set s = s if s is mapping else {} -%}{%- set a = a if a is mapping else {} -%}
+              {%- if channel == 's' -%}{%- set s = dict(s, **{(destination | string): fingerprint}) -%}
+              {%- else -%}{%- set a = dict(a, **{(destination | string): fingerprint}) -%}{%- endif -%}
+              {%- set clean = namespace(s={}, a={}) -%}
+              {%- for chat in chat_ids -%}
+                {%- if chat in s -%}{%- set clean.s = dict(clean.s, **{chat: s[chat]}) -%}{%- endif -%}
+                {%- if chat in a -%}{%- set clean.a = dict(clean.a, **{chat: a[chat]}) -%}{%- endif -%}
+              {%- endfor -%}
+              {{ 'K1|' ~ ({'v': 1, 'b': binding, 'd': plan.today, 's': clean.s, 'a': clean.a} | to_json) }}
+mode: queued
+max: 10
+max_exceeded: silent

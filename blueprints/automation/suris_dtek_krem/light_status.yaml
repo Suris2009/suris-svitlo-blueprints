@@ -1,0 +1,207 @@
+blueprint:
+  name: 02 DTEK KREM — Вікно статусу світла
+  domain: automation
+  author: Suris2009
+  homeassistant:
+    min_version: 2026.9.0
+  source_url: https://github.com/Suris2009/suris-svitlo-blueprints/blob/main/blueprints/automation/suris_dtek_krem/light_status.yaml
+  input:
+    krem_entry:
+      name: Запис інтеграції DTEK KREM Outages
+      selector:
+        config_entry:
+          integration: dtek_krem_outages
+    outage_group:
+      name: Черга
+      default: '1.1'
+      selector:
+        text: {}
+    power_sensor:
+      name: 'Датчик: off — світло є, on — світла немає'
+      selector:
+        entity:
+          filter:
+            domain: binary_sensor
+    callback_data:
+      name: Дані наявної Telegram-кнопки
+      default: check_light_status
+      selector:
+        text: {}
+    telegram_config_entry_id:
+      name: Telegram Bot Config Entry ID (необов’язково)
+      default: ''
+      selector:
+        text: {}
+alias: 02 DTEK KREM — Вікно статусу світла
+triggers:
+- trigger: event
+  event_type: telegram_client_callback_query
+  event_data:
+    data: !input 'callback_data'
+variables:
+  krem_entry: !input 'krem_entry'
+  group_input: !input 'outage_group'
+  group_key: '{{ ''GPV'' ~ (group_input | string | trim | upper | replace(''GPV'', '''')) }}'
+  group_label: '{{ group_key | replace(''GPV'', '''') }}'
+  power_entity: !input 'power_sensor'
+  bot_entry: !input 'telegram_config_entry_id'
+actions:
+- variables:
+    callback_id: |-
+      {% set data = trigger.event.data if trigger is defined and trigger.event is defined else {} %}
+      {{ data.get('id') or data.get('query_id') or '' }}
+- condition: template
+  value_template: '{{ callback_id | string | trim | length > 0 }}'
+- variables:
+    schedule_response: {}
+- action: dtek_krem_outages.get_schedule
+  continue_on_error: true
+  data:
+    config_entry_id: !input 'krem_entry'
+  response_variable: schedule_response
+- variables:
+    snapshot: |-
+      {% set ns = namespace(value={}) %}
+      {% set response = schedule_response if schedule_response is mapping else {} %}
+      {% set entries = response.get('entries', []) %}
+      {% if entries is sequence and entries is not string and entries is not mapping %}
+        {% for entry in entries %}
+          {% if entry is mapping and entry.get('config_entry_id') == krem_entry %}
+            {% set ns.value = entry %}
+          {% endif %}
+        {% endfor %}
+      {% endif %}
+      {{ ns.value }}
+- variables:
+    plan: |-
+      {%- set current = now() -%}
+      {%- set current_ts = as_timestamp(current) -%}
+      {%- set today = current.date().isoformat() -%}
+      {%- set tomorrow = (current + timedelta(days=1)).date().isoformat() -%}
+      {%- set publication = snapshot.get('publication', {}) -%}
+      {%- set publication = publication if publication is mapping else {} -%}
+      {%- set hidden = publication.get('schedule') == false or publication.get('daily') == false -%}
+      {%- set stale = snapshot.get('data_status') != 'current' -%}
+      {%- set source_groups = snapshot.get('groups', {}) -%}
+      {%- set source_groups = source_groups if source_groups is mapping else {} -%}
+      {%- set group_data = source_groups.get(group_key, {}) -%}
+      {%- set group_data = group_data if group_data is mapping else {} -%}
+      {%- set days = group_data.get('days', {}) -%}
+      {%- if not source_groups and snapshot.get('group') == group_key -%}
+        {%- set days = snapshot.get('days', {}) -%}
+      {%- endif -%}
+      {%- set days = days if days is mapping else {} -%}
+      {%- set available = snapshot | count > 0 and not snapshot.get('external_operator', false) -%}
+      {%- set ns = namespace(events=[], invalid=false, valid_days={}, signature=[]) -%}
+      {%- for date, day in days | dictsort -%}
+        {%- if day is mapping -%}
+          {%- set slots = day.get('schedule', '') -%}
+          {%- set valid_slots = slots is string and slots | length == 48 and slots is match('^[01?]{48}$') -%}
+          {%- if valid_slots -%}
+            {%- set ns.valid_days = dict(ns.valid_days, **{date: day}) -%}
+            {%- if date in [today, tomorrow] -%}
+              {%- set ns.signature = ns.signature + [[date, slots]] -%}
+            {%- endif -%}
+            {%- set items = day.get('outages', []) -%}
+            {%- if items is sequence and items is not string and items is not mapping -%}
+              {%- for item in items -%}
+                {%- if item is mapping -%}
+                  {%- set start = as_datetime(item.get('start'), none) -%}
+                  {%- set end = as_datetime(item.get('end'), none) -%}
+                  {%- if start is not none and start.tzinfo is none -%}{%- set start = start.replace(tzinfo=current.tzinfo) -%}{%- endif -%}
+                  {%- if end is not none and end.tzinfo is none -%}{%- set end = end.replace(tzinfo=current.tzinfo) -%}{%- endif -%}
+                  {%- set start_ts = as_timestamp(start, none) -%}
+                  {%- set end_ts = as_timestamp(end, none) -%}
+                  {%- if start_ts is not none and end_ts is not none and start_ts < end_ts -%}
+                    {%- set ns.events = ns.events + [{'start': start_ts, 'end': end_ts}] -%}
+                  {%- else -%}{%- set ns.invalid = true -%}{%- endif -%}
+                {%- else -%}{%- set ns.invalid = true -%}{%- endif -%}
+              {%- endfor -%}
+            {%- else -%}{%- set ns.invalid = true -%}{%- endif -%}
+          {%- elif date in [today, tomorrow] -%}{%- set ns.invalid = true -%}{%- endif -%}
+        {%- elif date in [today, tomorrow] -%}{%- set ns.invalid = true -%}{%- endif -%}
+      {%- endfor -%}
+      {%- set merged = namespace(events=[]) -%}
+      {%- for item in ns.events | sort(attribute='start') -%}
+        {%- if merged.events and item.start <= merged.events[-1].end -%}
+          {%- set prev = merged.events[-1] -%}
+          {%- set merged.events = merged.events[:-1] + [{'start': prev.start, 'end': [prev.end, item.end] | max}] -%}
+        {%- else -%}{%- set merged.events = merged.events + [item] -%}{%- endif -%}
+      {%- endfor -%}
+      {%- set window = namespace(current_end=none, next_start=none, sch='unknown') -%}
+      {%- if available and not hidden and not ns.invalid and today in ns.valid_days -%}
+        {%- set slot = current.hour * 2 + current.minute // 30 -%}
+        {%- set char = ns.valid_days[today]['schedule'][slot] -%}
+        {%- set window.sch = 'off' if char == '0' else 'on' if char == '1' else 'unknown' -%}
+        {%- for item in merged.events -%}
+          {%- if item.start <= current_ts < item.end -%}
+            {%- set end_local = as_datetime(item.end | timestamp_local).astimezone(current.tzinfo) -%}
+            {%- set end_date = end_local.date().isoformat() -%}
+            {%- set end_slot = end_local.hour * 2 + end_local.minute // 30 -%}
+            {%- if end_date in ns.valid_days and ns.valid_days[end_date]['schedule'][end_slot] == '1' -%}
+              {%- set window.current_end = item.end -%}
+            {%- endif -%}
+          {%- elif item.start > current_ts and window.next_start is none -%}
+            {%- set window.next_start = item.start -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {%- set address = snapshot.get('address_outage') -%}
+      {%- set address = address if address is mapping else {} -%}
+      {%- set address_fresh = available and snapshot.get('connection') == 'ok' and snapshot.get('settlement') and snapshot.get('street') and snapshot.get('house') and publication.get('current_outage') != false -%}
+      {%- set emergency = address_fresh and address.get('kind') == 'emergency' -%}
+      {{- {'available': available, 'hidden': hidden, 'stale': stale, 'invalid': ns.invalid,
+           'days': ns.valid_days, 'events': merged.events, 'signature': ns.signature,
+           'today': today, 'tomorrow': tomorrow, 'today_known': today in ns.valid_days,
+           'tomorrow_known': tomorrow in ns.valid_days, 'sch': window.sch,
+           'current_end': window.current_end, 'next_start': window.next_start,
+           'address_fresh': address_fresh | bool, 'emergency': emergency | bool,
+           'address': address} -}}
+- variables:
+    popup_message: |-
+      {%- set current = now() -%}
+          {%- set current_ts = as_timestamp(current) -%}
+          {%- set p = states(power_entity) -%}
+          {%- set fact = 'on' if p == 'off' else 'off' if p == 'on' else 'unknown' -%}
+          {%- set status = '🟩🟩🟩 СВІТЛО Є' if fact == 'on' else '🟥🟥🟥 СВІТЛА НЕМАЄ' if fact == 'off' else '⚠️ Невідомо' -%}
+          {%- set result = namespace(target=none, direction='', text='') -%}
+          {%- if plan.emergency -%}
+            {%- set result.text = '🚨 За адресою аварія; графік може не діяти' -%}
+            {%- if fact == 'off' -%}
+              {%- set end = as_datetime(plan.address.get('end'), none) -%}
+              {%- if end is not none and end.tzinfo is none -%}{%- set end = end.replace(tzinfo=current.tzinfo) -%}{%- endif -%}
+              {%- set end_ts = as_timestamp(end, none) -%}
+              {%- if end_ts is not none and end_ts > current_ts -%}
+                {%- set result.target = end_ts -%}{%- set result.direction = 'відновлення за ДТЕК' -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- elif not plan.available -%}{%- set result.text = '🔹Графік недоступний' -%}
+          {%- elif plan.hidden -%}{%- set result.text = '🔹ДТЕК приховав графік; час не підтверджено' -%}
+          {%- elif plan.invalid -%}{%- set result.text = '🔹Некоректні дані графіка' -%}
+          {%- elif not plan.today_known -%}{%- set result.text = '🔹Графік на сьогодні ще не опубліковано' -%}
+          {%- elif plan.sch == 'off' -%}
+            {%- set result.target = plan.current_end -%}{%- set result.direction = 'увімкнення' -%}
+          {%- elif plan.sch == 'on' -%}
+            {%- set result.target = plan.next_start -%}{%- set result.direction = 'вимкнення' -%}
+          {%- else -%}{%- set result.text = '🔹Можливе відключення; точного часу немає' -%}
+          {%- endif -%}
+          {%- if result.target is not none -%}
+            {%- set minutes = ((result.target - current_ts) / 60) | int(0) -%}
+            {%- set duration = (minutes // 60) ~ 'год ' ~ (minutes % 60) ~ 'хв' if minutes > 0 else 'менше 1хв' -%}
+            {%- set result.text = '🔹До ' ~ result.direction ~ (': ' if plan.emergency else ' за графіком: ') ~ duration -%}
+          {%- elif not result.text -%}{%- set result.text = '🔹За графіком: наступне перемикання не визначене' -%}{%- endif -%}
+          {%- set mismatch = not plan.stale and not plan.hidden and not plan.invalid and not plan.emergency and plan.sch in ['on', 'off'] and fact in ['on', 'off'] and plan.sch != fact -%}
+          {%- set lines = ['Статус: ' ~ status, ''] -%}
+          {%- if mismatch -%}{%- set lines = lines + ['⚠️Факт не співпадає з графіком'] -%}{%- endif -%}
+          {%- if plan.stale and plan.available -%}{%- set lines = lines + ['⚠️Збережений графік'] -%}{%- endif -%}
+          {{- (lines + [result.text, '', '🕒 Перевірка: ' ~ current.strftime('%H:%M')]) | join('
+      ') -}}
+- variables:
+    callback_data: |-
+      {% set data = {'callback_query_id': callback_id, 'show_alert': true, 'message': popup_message} %}
+      {% if bot_entry | trim %}{% set data = dict(data, config_entry_id=bot_entry | trim) %}{% endif %}
+      {{ data }}
+- action: telegram_bot.answer_callback_query
+  data: '{{ callback_data }}'
+mode: parallel
+max: 10
