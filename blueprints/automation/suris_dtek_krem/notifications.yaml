@@ -1,5 +1,5 @@
 blueprint:
-  name: 01 DTEK KREM — Графіки та аварійні сповіщення
+  name: 01 DTEK KREM — Графіки, аварії та планові роботи
   domain: automation
   author: Suris2009
   homeassistant:
@@ -53,7 +53,7 @@ blueprint:
       selector:
         boolean: {}
     notify_emergency_changes:
-      name: Повідомляти про аварійні відключення за адресою
+      name: Повідомляти про аварії та планові роботи за адресою
       default: true
       selector:
         boolean: {}
@@ -62,7 +62,7 @@ blueprint:
       default: false
       selector:
         boolean: {}
-alias: 01 DTEK KREM — Графіки та аварійні сповіщення
+alias: 01 DTEK KREM — Графіки, аварії та планові роботи
 triggers:
 - trigger: event
   event_type: dtek_krem_outages_event
@@ -230,7 +230,7 @@ actions:
       {%- set address = snapshot.get('address_outage') -%}
       {%- set address = address if address is mapping else {} -%}
       {%- set address_fresh = available and snapshot.get('connection') == 'ok' and snapshot.get('settlement') and snapshot.get('street') and snapshot.get('house') and publication.get('current_outage') != false -%}
-      {%- set emergency = address_fresh and address.get('kind') == 'emergency' -%}
+      {%- set emergency = address_fresh and address.get('kind') in ['emergency', 'planned'] -%}
       {{- {'available': available, 'hidden': hidden, 'stale': stale, 'invalid': ns.invalid,
            'days': ns.valid_days, 'events': merged.events, 'signature': ns.signature,
            'today': today, 'tomorrow': tomorrow, 'today_known': today in ns.valid_days,
@@ -247,7 +247,7 @@ actions:
       {{ value if value is mapping and value.get('v') == 1 and value.get('b') == binding else {} }}
     schedule_fingerprint: '{{ (([plan.signature, base_title, location_name, group_key] | to_json) | sha256)[:16]
       }}'
-    address_fingerprint: '{{ ''E'' ~ (((plan.address | to_json) | sha256)[:16]) if plan.emergency else ''N'' }}'
+    address_fingerprint: '{{ (''P'' if plan.address.get(''kind'') == ''planned'' else ''E'') ~ (((plan.address | to_json) | sha256)[:16]) if plan.emergency else ''N'' }}'
     schedule_message: |-
       {%- set lines = namespace(items=[base_title | e, '📍 ' ~ (location_name | e) ~ ' • Черга ' ~ (group_label | e)]) -%}
           {%- for date, title in [(plan.today, 'СЬОГОДНІ'), (plan.tomorrow, 'ЗАВТРА')] -%}
@@ -278,22 +278,37 @@ actions:
           {{- lines.items | join('
       ') -}}
     emergency_message: |-
+      {%- set ev = trigger.event.data if trigger is defined and trigger.id is defined and trigger.id == 'address_outage' else {} -%}
       {%- if plan.emergency -%}
-            {%- set lines = namespace(items=['🚨 <b>ДТЕК: АВАРІЙНЕ ВІДКЛЮЧЕННЯ ЗА АДРЕСОЮ</b>', '', '📍 ' ~ (location_name | e)]) -%}
-            {%- if plan.address.get('reason') -%}{%- set lines.items = lines.items + ['Причина: ' ~ (plan.address.reason | string | e)] -%}{%- endif -%}
-            {%- set end = as_datetime(plan.address.get('end'), none) -%}
-            {%- if end is not none -%}
-              {%- set lines.items = lines.items + ['Орієнтовне відновлення за ДТЕК: ' ~ end.astimezone(now().tzinfo).strftime('%H:%M (%d.%m)')] -%}
-            {%- else -%}{%- set lines.items = lines.items + ['Час відновлення ДТЕК не повідомив'] -%}{%- endif -%}
-            {%- set lines.items = lines.items + ['', '⚠️ Графік черги може не діяти. Фактичний стан світла визначає наш датчик.'] -%}
-            {{- lines.items | join('
-      ') -}}
-          {%- else -%}
-            {{- ['✅ <b>ДТЕК ОНОВИВ ІНФОРМАЦІЮ ЗА АДРЕСОЮ</b>', '', '📍 ' ~ (location_name | e),
-                 'ДТЕК більше не позначає це відключення як аварійне.',
-                 'Фактичне повернення світла підтвердить наш датчик.'] | join('
-      ') -}}
-          {%- endif -%}
+        {%- set planned = plan.address.get('kind') == 'planned' -%}
+        {%- set title = '🛠 ДТЕК: ПЛАНОВІ РОБОТИ' if planned else '🚨 ДТЕК: АВАРІЙНЕ ВІДКЛЮЧЕННЯ' -%}
+        {%- set changed = ev.get('status') == 'updated' -%}
+        {%- if changed -%}{%- set title = title ~ ' — ОНОВЛЕННЯ' -%}{%- endif -%}
+        {%- set lines = namespace(items=['<b>' ~ title ~ '</b>', '', '📍 ' ~ (location_name | e)]) -%}
+        {%- if plan.address.get('reason') -%}
+          {%- set lines.items = lines.items + ['Причина: ' ~ (plan.address.reason | string | e)] -%}
+        {%- endif -%}
+        {%- set begin = as_datetime(plan.address.get('start'), none) -%}
+        {%- if begin is not none -%}
+          {%- set lines.items = lines.items + ['Початок за ДТЕК: ' ~ as_local(begin).strftime('%H:%M (%d.%m)')] -%}
+        {%- endif -%}
+        {%- set finish = as_datetime(plan.address.get('end'), none) -%}
+        {%- set old = as_datetime(ev.get('previous_end'), none) -%}
+        {%- if changed and ev.get('previous_end') != plan.address.get('end') -%}
+          {%- set before = as_local(old).strftime('%H:%M (%d.%m)') if old is not none else 'не вказано' -%}
+          {%- set after = as_local(finish).strftime('%H:%M (%d.%m)') if finish is not none else 'не вказано' -%}
+          {%- set lines.items = lines.items + ['⏰ Орієнтовне відновлення змінено: ' ~ before ~ ' → ' ~ after] -%}
+        {%- elif finish is not none -%}
+          {%- set lines.items = lines.items + ['Орієнтовне відновлення за ДТЕК: ' ~ as_local(finish).strftime('%H:%M (%d.%m)')] -%}
+        {%- else -%}
+          {%- set lines.items = lines.items + ['Час відновлення ДТЕК не повідомив'] -%}
+        {%- endif -%}
+        {%- set lines.items = lines.items + ['', 'ℹ️ Це інформація ДТЕК за адресою. Фактичне повернення світла підтвердить наш датчик.'] -%}
+      {%- else -%}
+        {%- set lines = namespace(items=['✅ <b>ДТЕК ЗНЯВ ПОВІДОМЛЕННЯ ПРО АВАРІЮ АБО РОБОТИ</b>', '', '📍 ' ~ (location_name | e), 'ДТЕК більше не позначає це відключення як аварію або планові роботи.', 'Фактичне повернення світла підтвердить наш датчик.']) -%}
+      {%- endif -%}
+      {{- lines.items | join('\n') -}}
+
 - variables:
     rollover_only: '{{ not force_send and trigger.id in [''retry'', ''startup''] and saved.get(''d'', plan.today)
       != plan.today }}'
@@ -404,7 +419,7 @@ actions:
       then:
       - choose:
         - conditions: '{{ (plan.emergency and (force_send or fingerprint != previous_address)) or (not plan.emergency
-            and previous_address.startswith(''E'')) }}'
+            and (previous_address.startswith(''E'') or previous_address.startswith(''P''))) }}'
           sequence:
           - variables:
               send_result: {}
